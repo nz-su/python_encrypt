@@ -14,6 +14,13 @@ Python CLI that connects to a database and **encrypts or decrypts** configured s
 
 ## Quick start with uv
 
+Generate your key
+
+```bash
+python -c "import secrets, pathlib; pathlib.Path(r'C:\path\aes256.hex').write_text(secrets.token_hex(32), encoding='ascii')"
+
+```
+
 ```bash
 cd /path/to/python-encryption
 uv sync
