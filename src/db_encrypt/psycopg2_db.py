@@ -47,6 +47,10 @@ class _Psycopg2Cursor(DatabaseCursor):
         rows = self._raw.fetchmany(n)
         return list(rows) if rows else []
 
+    def column_names(self) -> list[str]:
+        desc = getattr(self._raw, "description", None) or []
+        return [str(col[0]) for col in desc]
+
     def close(self) -> None:
         self._raw.close()
 

@@ -1,0 +1,51 @@
+# Example manifest for db-encrypt (adjust JDBC URL, JAR paths, and tables).
+
+# Optional: select database backend (default jdbc). New implementations can extend this.
+database:
+  backend: jdbc
+
+jdbc:
+  url: "jdbc:postgresql://localhost:5432/mydb"
+  driver_class: "org.postgresql.Driver"
+  # One or more paths to JDBC driver JARs (use list or OS path separator).
+  classpath:
+    - "/path/to/postgresql-42.7.0.jar"
+  user: "dbuser"
+  password: "dbpass"
+
+# For native PostgreSQL (no JVM/JARs), use:
+# database:
+#   backend: psycopg2
+# postgres:
+#   dsn: "postgresql://dbuser:dbpass@localhost:5432/mydb"
+#   # connect_kwargs:
+#   #   connect_timeout: 10
+
+encryption:
+  primary_key_id: "v1"
+  keys:
+    - id: "v1"
+      # Exactly one of key_env or key_file per key entry (32-byte AES-256 key).
+      key_file: "/path/to/aes256-v1.key"
+      key_encoding: "raw32" # raw32 = binary file exactly 32 bytes; hex64 = 64 hex chars (file or env)
+    - id: "v2"
+      key_env: "DB_ENCRYPT_KEY_V2"
+      key_encoding: "hex64"
+
+options:
+  batch_size: 500
+  dry_run: false
+  skip_nulls: true
+  dialect: "ansi" # ansi = double-quote identifiers (PostgreSQL, Oracle, etc.); mysql = backticks
+  # Optional extra JDBC properties passed to the driver:
+  # connection_props:
+  #   sslmode: "require"
+
+tables:
+  - name: "public.users"
+    key_columns: ["id"]
+    encrypt_columns: ["email", "phone"]
+
+  - name: "public.orders"
+    key_columns: ["id"]
+    encrypt_columns: ["notes"]

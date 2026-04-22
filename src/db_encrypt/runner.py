@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Literal
 
@@ -25,44 +26,63 @@ def _cell_to_str(value: object) -> str | None:
     return str(value)
 
 
+def _cell_to_payload(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return _cell_to_str(value)
+
+
 def _transform_row(
     mode: Mode,
     row: tuple,
-    n_keys: int,
-    encrypt_cols: list[str],
-    key: bytes,
+    encrypt_col_indexes: list[int],
+    keyring: dict[str, bytes],
+    primary_key_id: str,
+    primary_key: bytes,
 ) -> tuple[list[object], bool]:
-    """Build new encrypt-column values; True if UPDATE should run."""
-    enc_vals = list(row[n_keys:])
-    new_enc: list[object] = []
+    """Return a transformed copy of ``row`` and whether any encrypted field changed."""
+    new_row = list(row)
     any_change = False
 
-    for i, col in enumerate(encrypt_cols):
-        raw = enc_vals[i]
-        s = _cell_to_str(raw)
+    for idx in encrypt_col_indexes:
+        raw = row[idx]
+        s = _cell_to_payload(raw)
         if s is None:
-            new_enc.append(None)
+            new_row[idx] = None
             continue
 
         if mode == "encrypt":
-            if crypto.try_decrypt_field(s, key) is not None:
-                new_enc.append(s)
+            if crypto.try_decrypt_field(s, keyring) is not None:
+                new_row[idx] = s
                 continue
-            new_s = crypto.encrypt_field(s, key)
-            new_enc.append(new_s)
+            new_s = crypto.encrypt_field(s, primary_key_id, primary_key)
+            new_row[idx] = new_s
             if new_s != s:
                 any_change = True
         else:
-            dec = crypto.try_decrypt_field(s, key)
+            dec = crypto.try_decrypt_field(s, keyring)
             if dec is None:
-                new_enc.append(raw)
+                new_row[idx] = raw
                 continue
             plain = dec.decode("utf-8")
-            new_enc.append(plain)
+            new_row[idx] = plain
             if plain != s:
                 any_change = True
 
-    return new_enc, any_change
+    return new_row, any_change
+
+
+def _destination_table_name(source_table: str) -> str:
+    if "." in source_table:
+        schema, table = source_table.rsplit(".", 1)
+        return f"{schema}.{table}_encrypted"
+    return f"{source_table}_encrypted"
+
+
+def _decrypt_source_table_name(manifest_table: str) -> str:
+    return _destination_table_name(manifest_table)
 
 
 def _process_table(
@@ -72,55 +92,98 @@ def _process_table(
     mode: Mode,
     dry_run: bool,
 ) -> tuple[int, int]:
-    key = manifest.resolved_key()
+    keyring = manifest.resolved_keyring()
+    primary_key_id, primary_key = manifest.resolved_primary_key()
     opts = manifest.options
     dialect = opts.dialect
-    n_keys = len(table.key_columns)
-    qtable = quote_table(table.name, dialect)
-    cols = [quote_ident(c, dialect) for c in table.key_columns + table.encrypt_columns]
-    select_sql = f"SELECT {', '.join(cols)} FROM {qtable}"
-
-    set_parts = [f"{quote_ident(c, dialect)} = ?" for c in table.encrypt_columns]
-    where_parts = [f"{quote_ident(c, dialect)} = ?" for c in table.key_columns]
-    update_sql = (
-        f"UPDATE {qtable} SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)}"
-    )
+    source_table = table.name if mode == "encrypt" else _decrypt_source_table_name(table.name)
+    source_qtable = quote_table(source_table, dialect)
+    destination_table = _destination_table_name(table.name)
+    destination_qtable = quote_table(destination_table, dialect)
+    select_sql = f"SELECT * FROM {source_qtable}"
 
     processed = 0
-    updated = 0
+    result_count = 0
     batch_size = opts.batch_size
 
     select_cur = db.cursor()
     select_cur.arraysize = batch_size
-    update_cur = db.cursor()
+    write_cur = db.cursor() if mode == "encrypt" else None
     try:
         select_cur.execute(select_sql)
+        source_columns = select_cur.column_names()
+        if not source_columns:
+            raise ValueError(f"Could not read columns for table {table.name!r}")
+
+        missing = [c for c in table.encrypt_columns if c not in source_columns]
+        if missing:
+            missing_csv = ", ".join(missing)
+            raise ValueError(
+                f"Table {table.name!r} is missing encrypt_columns: {missing_csv}"
+            )
+        missing_keys = [c for c in table.key_columns if c not in source_columns]
+        if missing_keys:
+            missing_keys_csv = ", ".join(missing_keys)
+            raise ValueError(
+                f"Table {table.name!r} is missing key_columns: {missing_keys_csv}"
+            )
+
+        encrypt_indexes = [source_columns.index(c) for c in table.encrypt_columns]
+        insert_sql = ""
+        if mode == "encrypt":
+            insert_cols = ", ".join(quote_ident(c, dialect) for c in source_columns)
+            insert_placeholders = ", ".join("?" for _ in source_columns)
+            insert_sql = (
+                f"INSERT INTO {destination_qtable} ({insert_cols}) "
+                f"VALUES ({insert_placeholders})"
+            )
+
+        if mode == "encrypt" and not dry_run:
+            assert write_cur is not None
+            create_sql = (
+                f"CREATE TABLE IF NOT EXISTS {destination_qtable} AS "
+                f"SELECT * FROM {source_qtable} WHERE 1=0"
+            )
+            write_cur.execute(create_sql)
+            for col in table.encrypt_columns:
+                qcol = quote_ident(col, dialect)
+                write_cur.execute(
+                    f"ALTER TABLE {destination_qtable} ALTER COLUMN {qcol} TYPE TEXT"
+                )
+            write_cur.execute(f"TRUNCATE TABLE {destination_qtable}")
+
         while True:
             rows = select_cur.fetchmany(batch_size)
             if not rows:
                 break
             for row in rows:
                 processed += 1
-                new_enc, should_update = _transform_row(
+                new_row, _changed = _transform_row(
                     mode,
                     row,
-                    n_keys,
-                    table.encrypt_columns,
-                    key,
+                    encrypt_indexes,
+                    keyring,
+                    primary_key_id,
+                    primary_key,
                 )
-                if not should_update:
+                if mode == "decrypt":
+                    obj = {col: val for col, val in zip(source_columns, new_row)}
+                    print(json.dumps(obj, ensure_ascii=False))
+                    result_count += 1
                     continue
+
                 if dry_run:
-                    updated += 1
+                    result_count += 1
                     continue
-                params = list(new_enc) + list(row[:n_keys])
-                update_cur.execute(update_sql, params)
-                updated += 1
+                assert write_cur is not None
+                write_cur.execute(insert_sql, new_row)
+                result_count += 1
     finally:
         select_cur.close()
-        update_cur.close()
+        if write_cur is not None:
+            write_cur.close()
 
-    return processed, updated
+    return processed, result_count
 
 
 def run_manifest(
@@ -136,20 +199,30 @@ def run_manifest(
     try:
         db.set_autocommit(False)
         for tbl in manifest.tables:
+            destination_table = _destination_table_name(tbl.name)
+            decrypt_source_table = _decrypt_source_table_name(tbl.name)
             log.info(
                 "Table %s: %s (%s)",
-                tbl.name,
+                (
+                    f"{tbl.name} -> {destination_table}"
+                    if mode == "encrypt"
+                    else f"{decrypt_source_table} -> stdout"
+                ),
                 mode,
                 "dry-run" if dry_run else "live",
             )
-            processed, n_updated = _process_table(db, tbl, manifest, mode, dry_run)
+            processed, n_result = _process_table(db, tbl, manifest, mode, dry_run)
             log.info(
                 "  rows scanned: %d, %s: %d",
                 processed,
-                "rows to update" if dry_run else "rows updated",
-                n_updated,
+                (
+                    "rows emitted"
+                    if mode == "decrypt"
+                    else ("rows to insert" if dry_run else "rows inserted")
+                ),
+                n_result,
             )
-            if not dry_run:
+            if mode == "encrypt" and not dry_run:
                 db.commit()
     except Exception:
         try:

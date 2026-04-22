@@ -1,0 +1,23 @@
+database:
+  backend: psycopg2
+
+postgres:
+  dsn: "postgresql://postgres:postgres@localhost:55432/northwind"
+
+encryption:
+  primary_key_id: "v1"
+  keys:
+    - id: "v1"
+      key_file: "./aes256.key"
+      key_encoding: "hex64"
+
+options:
+  batch_size: 1000
+  dry_run: false
+  skip_nulls: true
+  dialect: "ansi"
+
+tables:
+  - name: "public.customers"
+    key_columns: ["customer_id"]  
+    encrypt_columns: ["address", "city", "region", "postal_code", "phone"]

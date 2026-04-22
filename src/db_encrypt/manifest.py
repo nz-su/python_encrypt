@@ -36,10 +36,17 @@ class JdbcConfig:
 
 
 @dataclass
-class EncryptionConfig:
+class EncryptionKeyConfig:
+    id: str
     key_env: str | None = None
     key_file: str | None = None
     key_encoding: str = "raw32"
+
+
+@dataclass
+class EncryptionConfig:
+    primary_key_id: str
+    keys: list[EncryptionKeyConfig]
 
 
 @dataclass
@@ -69,12 +76,22 @@ class Manifest:
     options: Options = field(default_factory=Options)
     database_backend: str = "jdbc"
 
-    def resolved_key(self) -> bytes:
-        return load_key(
-            key_env=self.encryption.key_env,
-            key_file=self.encryption.key_file,
-            key_encoding=self.encryption.key_encoding,
-        )
+    def resolved_keyring(self) -> dict[str, bytes]:
+        out: dict[str, bytes] = {}
+        for k in self.encryption.keys:
+            out[k.id] = load_key(
+                key_env=k.key_env,
+                key_file=k.key_file,
+                key_encoding=k.key_encoding,
+            )
+        return out
+
+    def resolved_primary_key(self) -> tuple[str, bytes]:
+        keyring = self.resolved_keyring()
+        key_id = self.encryption.primary_key_id
+        if key_id not in keyring:
+            raise CryptoError(f"primary_key_id {key_id!r} not found in keys")
+        return key_id, keyring[key_id]
 
 
 def _normalize_classpath(cp: Any) -> list[str]:
@@ -133,15 +150,47 @@ def load_manifest(path: str | Path) -> Manifest:
         )
 
     e = data.get("encryption") or {}
-    encryption = EncryptionConfig(
-        key_env=e.get("key_env"),
-        key_file=e.get("key_file"),
-        key_encoding=str(e.get("key_encoding", "raw32")),
-    )
-    if not encryption.key_env and not encryption.key_file:
-        raise CryptoError("encryption.key_env or encryption.key_file is required")
-    if encryption.key_encoding not in ("raw32", "hex64"):
-        raise CryptoError("encryption.key_encoding must be raw32 or hex64")
+    if not isinstance(e, dict):
+        raise CryptoError("encryption must be a mapping")
+    primary_key_id = str(e.get("primary_key_id", "")).strip()
+    if not primary_key_id:
+        raise CryptoError("encryption.primary_key_id is required")
+    keys_raw = e.get("keys")
+    if not isinstance(keys_raw, list) or not keys_raw:
+        raise CryptoError("encryption.keys must be a non-empty list")
+    key_entries: list[EncryptionKeyConfig] = []
+    seen_ids: set[str] = set()
+    for i, item in enumerate(keys_raw):
+        if not isinstance(item, dict):
+            raise CryptoError(f"encryption.keys[{i}] must be a mapping")
+        key_id = str(item.get("id", "")).strip()
+        if not key_id:
+            raise CryptoError(f"encryption.keys[{i}].id is required")
+        if key_id in seen_ids:
+            raise CryptoError(f"Duplicate encryption key id: {key_id!r}")
+        seen_ids.add(key_id)
+        key_env = item.get("key_env")
+        key_file = item.get("key_file")
+        if bool(key_env) == bool(key_file):
+            raise CryptoError(
+                f"encryption.keys[{i}] must define exactly one of key_env or key_file"
+            )
+        key_encoding = str(item.get("key_encoding", "raw32"))
+        if key_encoding not in ("raw32", "hex64"):
+            raise CryptoError(
+                f"encryption.keys[{i}].key_encoding must be raw32 or hex64"
+            )
+        key_entries.append(
+            EncryptionKeyConfig(
+                id=key_id,
+                key_env=str(key_env) if key_env is not None else None,
+                key_file=str(key_file) if key_file is not None else None,
+                key_encoding=key_encoding,
+            )
+        )
+    if primary_key_id not in seen_ids:
+        raise CryptoError("encryption.primary_key_id must match one configured key id")
+    encryption = EncryptionConfig(primary_key_id=primary_key_id, keys=key_entries)
 
     o = data.get("options") or {}
     options = Options(

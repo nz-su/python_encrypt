@@ -71,6 +71,14 @@ class DatabaseCursor(ABC):
         """
 
     @abstractmethod
+    def column_names(self) -> list[str]:
+        """Return result-set column names after ``execute`` of a ``SELECT``.
+
+        Used by the runner when it must transform full rows while preserving
+        source column order.
+        """
+
+    @abstractmethod
     def close(self) -> None:
         """Release server/client resources for this cursor."""
 
