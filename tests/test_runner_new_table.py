@@ -99,7 +99,7 @@ def _manifest(tmp_path: Path) -> Manifest:
     )
 
 
-def test_run_manifest_writes_into_destination_table(tmp_path: Path, monkeypatch) -> None:
+def test_run_manifest_updates_source_table_in_place(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "db_encrypt.runner.crypto.try_decrypt_field", lambda s, keyring: None
     )
@@ -128,41 +128,40 @@ def test_run_manifest_writes_into_destination_table(tmp_path: Path, monkeypatch)
     run_manifest(_manifest(tmp_path), "encrypt", dry_run=False, database=db)
 
     sql_ops = [op for op, _ in write_cur.executed]
-    assert sql_ops[0].startswith(
-        'CREATE TABLE IF NOT EXISTS "northwind"."employees_encrypted" AS SELECT *'
+    assert (
+        sql_ops[0]
+        == 'ALTER TABLE "northwind"."employees" ALTER COLUMN "address" TYPE TEXT'
     )
     assert (
         sql_ops[1]
-        == 'ALTER TABLE "northwind"."employees_encrypted" ALTER COLUMN "address" TYPE TEXT'
+        == 'ALTER TABLE "northwind"."employees" ALTER COLUMN "city" TYPE TEXT'
     )
     assert (
         sql_ops[2]
-        == 'ALTER TABLE "northwind"."employees_encrypted" ALTER COLUMN "city" TYPE TEXT'
+        == 'ALTER TABLE "northwind"."employees" ALTER COLUMN "region" TYPE TEXT'
     )
     assert (
         sql_ops[3]
-        == 'ALTER TABLE "northwind"."employees_encrypted" ALTER COLUMN "region" TYPE TEXT'
+        == 'ALTER TABLE "northwind"."employees" ALTER COLUMN "postal_code" TYPE TEXT'
     )
     assert (
         sql_ops[4]
-        == 'ALTER TABLE "northwind"."employees_encrypted" ALTER COLUMN "postal_code" TYPE TEXT'
+        == 'ALTER TABLE "northwind"."employees" ALTER COLUMN "phone" TYPE TEXT'
     )
     assert (
         sql_ops[5]
-        == 'ALTER TABLE "northwind"."employees_encrypted" ALTER COLUMN "phone" TYPE TEXT'
+        == 'UPDATE "northwind"."employees" SET "address" = ?, "city" = ?, '
+        '"region" = ?, "postal_code" = ?, "phone" = ? WHERE "employee_id" = ?'
     )
-    assert sql_ops[6] == 'TRUNCATE TABLE "northwind"."employees_encrypted"'
-    assert sql_ops[7].startswith('INSERT INTO "northwind"."employees_encrypted"')
 
-    _, insert_params = write_cur.executed[7]
-    assert insert_params == [
-        1,
+    _, update_params = write_cur.executed[5]
+    assert update_params == [
         "k1:iv:A St",
         "k1:iv:Seattle",
         "k1:iv:WA",
         "k1:iv:98101",
         "k1:iv:555",
-        "Manager",
+        1,
     ]
     assert db.commits == 1
     assert db.autocommit_calls == [False]
@@ -221,7 +220,7 @@ def test_run_manifest_decrypt_reads_suffix_and_prints_jsonl(
 
     run_manifest(_manifest(tmp_path), "decrypt", dry_run=False, database=db)
 
-    assert select_cur.executed[0][0] == 'SELECT * FROM "northwind"."employees_encrypted"'
+    assert select_cur.executed[0][0] == 'SELECT * FROM "northwind"."employees"'
     assert write_cur.executed == []
     assert db.commits == 0
 

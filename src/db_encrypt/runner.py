@@ -74,17 +74,6 @@ def _transform_row(
     return new_row, any_change
 
 
-def _destination_table_name(source_table: str) -> str:
-    if "." in source_table:
-        schema, table = source_table.rsplit(".", 1)
-        return f"{schema}.{table}_encrypted"
-    return f"{source_table}_encrypted"
-
-
-def _decrypt_source_table_name(manifest_table: str) -> str:
-    return _destination_table_name(manifest_table)
-
-
 def _process_table(
     db: Database,
     table: TableConfig,
@@ -96,10 +85,8 @@ def _process_table(
     primary_key_id, primary_key = manifest.resolved_primary_key()
     opts = manifest.options
     dialect = opts.dialect
-    source_table = table.name if mode == "encrypt" else _decrypt_source_table_name(table.name)
+    source_table = table.name
     source_qtable = quote_table(source_table, dialect)
-    destination_table = _destination_table_name(table.name)
-    destination_qtable = quote_table(destination_table, dialect)
     select_sql = f"SELECT * FROM {source_qtable}"
 
     processed = 0
@@ -129,28 +116,24 @@ def _process_table(
             )
 
         encrypt_indexes = [source_columns.index(c) for c in table.encrypt_columns]
-        insert_sql = ""
+        key_indexes = [source_columns.index(c) for c in table.key_columns]
+        update_sql = ""
         if mode == "encrypt":
-            insert_cols = ", ".join(quote_ident(c, dialect) for c in source_columns)
-            insert_placeholders = ", ".join("?" for _ in source_columns)
-            insert_sql = (
-                f"INSERT INTO {destination_qtable} ({insert_cols}) "
-                f"VALUES ({insert_placeholders})"
+            set_clause = ", ".join(
+                f"{quote_ident(c, dialect)} = ?" for c in table.encrypt_columns
             )
+            where_clause = " AND ".join(
+                f"{quote_ident(c, dialect)} = ?" for c in table.key_columns
+            )
+            update_sql = f"UPDATE {source_qtable} SET {set_clause} WHERE {where_clause}"
 
         if mode == "encrypt" and not dry_run:
             assert write_cur is not None
-            create_sql = (
-                f"CREATE TABLE IF NOT EXISTS {destination_qtable} AS "
-                f"SELECT * FROM {source_qtable} WHERE 1=0"
-            )
-            write_cur.execute(create_sql)
             for col in table.encrypt_columns:
                 qcol = quote_ident(col, dialect)
                 write_cur.execute(
-                    f"ALTER TABLE {destination_qtable} ALTER COLUMN {qcol} TYPE TEXT"
+                    f"ALTER TABLE {source_qtable} ALTER COLUMN {qcol} TYPE TEXT"
                 )
-            write_cur.execute(f"TRUNCATE TABLE {destination_qtable}")
 
         while True:
             rows = select_cur.fetchmany(batch_size)
@@ -176,7 +159,9 @@ def _process_table(
                     result_count += 1
                     continue
                 assert write_cur is not None
-                write_cur.execute(insert_sql, new_row)
+                update_params = [new_row[idx] for idx in encrypt_indexes]
+                update_params.extend(row[idx] for idx in key_indexes)
+                write_cur.execute(update_sql, update_params)
                 result_count += 1
     finally:
         select_cur.close()
@@ -199,15 +184,9 @@ def run_manifest(
     try:
         db.set_autocommit(False)
         for tbl in manifest.tables:
-            destination_table = _destination_table_name(tbl.name)
-            decrypt_source_table = _decrypt_source_table_name(tbl.name)
             log.info(
                 "Table %s: %s (%s)",
-                (
-                    f"{tbl.name} -> {destination_table}"
-                    if mode == "encrypt"
-                    else f"{decrypt_source_table} -> stdout"
-                ),
+                tbl.name if mode == "encrypt" else f"{tbl.name} -> stdout",
                 mode,
                 "dry-run" if dry_run else "live",
             )
